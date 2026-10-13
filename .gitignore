@@ -1,1 +1,14 @@
 nexus-opti-ml-2026-operation-insight
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+data/
+prepared/
+runs/
+artifacts/
+catboost_info/
+*.zip
+.env
+kaggle.json
