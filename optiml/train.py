@@ -18,13 +18,16 @@ from .history import add_history
 def id_digest(ids):
     return hashlib.sha256('\n'.join(sorted(ids.astype(str))).encode()).hexdigest()
 
-def split_frame(frame, cutoff, train_months=None):
+def split_frame(frame, cutoff, train_months=None, validation_months=None):
     cutoff = pd.Timestamp(cutoff)
     before = frame['_order_time'] < cutoff
     if train_months:
         before &= frame['_order_time'] >= cutoff - pd.DateOffset(months=train_months)
     fit = frame.loc[before].copy()
-    valid = frame.loc[frame['_order_time'] >= cutoff].copy()
+    validation = frame['_order_time'] >= cutoff
+    if validation_months:
+        validation &= frame['_order_time'] < cutoff + pd.DateOffset(months=validation_months)
+    valid = frame.loc[validation].copy()
     if fit.empty or valid.empty or fit.returned.nunique() != 2 or valid.returned.nunique() != 2:
         raise ValueError('Both temporal partitions must contain both target classes')
     if set(fit.order_id).intersection(valid.order_id):
@@ -39,10 +42,14 @@ def select_orders(frame, fraction, seed):
     selected = ((hashed ^ np.uint64(seed)) % np.uint64(1_000_003)) < int(fraction * 1_000_003)
     return frame.loc[selected].copy()
 
-def model_inputs(fit, forecast, include_promo, history, family):
+def model_inputs(fit, forecast, include_promo, history, family, drop_features=()):
     if history:
         fit, forecast = add_history(fit, forecast)
     cols = feature_columns(fit, include_promo)
+    unknown = set(drop_features) - set(cols)
+    if unknown:
+        raise ValueError(f'Unknown/excluded drop features: {sorted(unknown)}')
+    cols = [c for c in cols if c not in drop_features]
     x, z, levels = encode_categories(fit, forecast, cols)
     if family == 'catboost':
         for c in levels:
@@ -51,21 +58,36 @@ def model_inputs(fit, forecast, include_promo, history, family):
     schema = {'features': cols, 'category_levels': levels, 'history': history,
               'history_policy': 'monthly expanding, prior months only, frozen forecast',
               'label_maturity_assumption': 'all prior-month labels available; no event dates supplied',
-              'include_promo': include_promo}
+              'include_promo': include_promo, 'drop_features': list(drop_features)}
     return x, z, schema
 
+def backend_parameters(family, device):
+    """Never silently substitute CPU for a requested GPU backend."""
+    if family == 'lightgbm':
+        if device == 'CPU':
+            return {'device_type': 'cpu', 'deterministic': True, 'force_col_wise': True}
+        if device in {'GPU', 'CUDA'}:
+            return {'device_type': device.lower(), 'gpu_device_id': 0}
+    elif family == 'catboost':
+        if device == 'CPU':
+            return {'task_type': 'CPU'}
+        if device == 'GPU':
+            return {'task_type': 'GPU', 'devices': '0'}
+    raise ValueError(f'Unsupported model/device: {family}/{device}; CatBoost uses GPU, not CUDA, as its CLI value')
+
 def fit_model(x, y, z, labels, schema, args, output, iterations):
+    backend = backend_parameters(args.model, args.device)
+    print(f'Training {args.model} with backend {backend}', flush=True)
     if args.model == 'lightgbm':
         import lightgbm as lgb
-        if args.device != 'CPU':
-            raise ValueError('This baseline supports LightGBM CPU; use CatBoost for GPU')
         model = lgb.LGBMClassifier(
             objective='binary', metric='auc', n_estimators=iterations,
             learning_rate=args.learning_rate, num_leaves=args.num_leaves,
-            min_child_samples=args.min_child_samples, reg_lambda=5.0,
+            min_child_samples=args.min_child_samples, reg_lambda=args.l2,
+            max_bin=args.max_bin,
             colsample_bytree=0.85, subsample=0.85, subsample_freq=1,
             random_state=args.seed, n_jobs=args.threads, verbosity=-1,
-            deterministic=True, force_col_wise=True,
+            **backend,
         )
         kwargs = {}
         if z is not None:
@@ -80,12 +102,11 @@ def fit_model(x, y, z, labels, schema, args, output, iterations):
             from catboost import CatBoostClassifier
         except ImportError as e:
             raise RuntimeError('Install requirements-catboost.txt for this model') from e
-        kwargs = {'devices': '0'} if args.device == 'GPU' else {}
         model = CatBoostClassifier(
-            loss_function='Logloss', eval_metric='AUC', task_type=args.device,
+            loss_function='Logloss', eval_metric='AUC',
             iterations=iterations, depth=args.depth, learning_rate=args.learning_rate,
-            l2_leaf_reg=5, max_ctr_complexity=1, random_seed=args.seed,
-            thread_count=args.threads, train_dir=str(output / 'catboost_info'), **kwargs,
+            l2_leaf_reg=args.l2, max_ctr_complexity=1, random_seed=args.seed,
+            thread_count=args.threads, train_dir=str(output / 'catboost_info'), **backend,
         )
         fit_kwargs = {'eval_set': (z, labels), 'early_stopping_rounds': args.patience} if z is not None else {}
         model.fit(x, y, cat_features=list(schema['category_levels']), verbose=100, **fit_kwargs)
@@ -136,7 +157,8 @@ def main():
     parser.add_argument('--prepared-dir', required=True, type=Path)
     parser.add_argument('--output-dir', required=True, type=Path)
     parser.add_argument('--model', choices=['lightgbm', 'catboost'], default='lightgbm')
-    parser.add_argument('--device', choices=['CPU', 'GPU'], default='CPU')
+    parser.add_argument('--device', choices=['CPU', 'GPU', 'CUDA'], default='CPU',
+                        help='LightGBM: CPU, GPU (OpenCL), CUDA (Linux NVIDIA). CatBoost: CPU or GPU.')
     parser.add_argument('--cutoff', default='2024-07-01')
     parser.add_argument('--iterations', type=int, default=2000)
     parser.add_argument('--patience', type=int, default=150)
@@ -144,19 +166,29 @@ def main():
     parser.add_argument('--num-leaves', type=int, default=31)
     parser.add_argument('--min-child-samples', type=int, default=200)
     parser.add_argument('--depth', type=int, default=6)
+    parser.add_argument('--l2', type=float, default=5.0)
+    parser.add_argument('--max-bin', type=int, default=255)
+    parser.add_argument('--drop-features', nargs='+', default=[], help='Explicit feature ablation; IDs remain available for history')
     parser.add_argument('--threads', type=int, default=2)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--train-months', type=int)
+    parser.add_argument('--validation-months', type=int,
+                        help='Limit validation to this many months after cutoff; final refit is unaffected')
     parser.add_argument('--include-promo', action='store_true')
     parser.add_argument('--no-history', action='store_true')
     parser.add_argument('--sample-order-fraction', type=float, default=1.0,
                         help='Development only: sample complete orders on BOTH sides; changes validation IDs')
     parser.add_argument('--finalize', action='store_true', help='After validation, refit on labeled data and write submission')
     args = parser.parse_args()
-    if not 0 < args.sample_order_fraction <= 1 or args.iterations < 1 or args.patience < 1 or (args.train_months is not None and args.train_months < 1):
+    if (not 0 < args.sample_order_fraction <= 1 or args.iterations < 1 or args.patience < 1
+            or (args.train_months is not None and args.train_months < 1)
+            or (args.validation_months is not None and args.validation_months < 1)):
         parser.error('Invalid fraction, iterations, patience, or training window')
     if args.finalize and args.sample_order_fraction != 1:
         parser.error('Finalization requires full data (--sample-order-fraction 1)')
+    if args.l2 < 0 or args.max_bin < 2:
+        parser.error('l2 must be nonnegative and max-bin >= 2')
+    backend_parameters(args.model, args.device)
     # Fail before expensive data loading if the chosen model dependency is absent.
     __import__(args.model)
     args.output_dir.mkdir(parents=True, exist_ok=False)
@@ -173,18 +205,19 @@ def main():
         revision = 'unknown; see saved source'
     meta = json.loads((args.prepared_dir / 'manifest.json').read_text())
     meta.update({'code_sha': revision, 'started_utc': datetime.now(timezone.utc).isoformat()})
+    meta['backend'] = backend_parameters(args.model, args.device)
     (args.output_dir / 'metadata.json').write_text(json.dumps(meta, indent=2))
     print('Loading prepared training features...', flush=True)
     frame = pd.read_parquet(args.prepared_dir / 'train.parquet')
     frame = select_orders(frame, args.sample_order_fraction, args.seed)
-    fit, valid = split_frame(frame, args.cutoff, args.train_months)
+    fit, valid = split_frame(frame, args.cutoff, args.train_months, args.validation_months)
     del frame
     gc.collect()
     manifest = pd.concat([fit[['order_line_id', 'order_id', '_month']].assign(role='fit'), valid[['order_line_id', 'order_id', '_month']].assign(role='validation')])
     manifest.to_parquet(args.output_dir / 'fold_manifest.parquet', index=False)
     del manifest
     print(f'Fit {len(fit):,} rows; validate {len(valid):,} rows. Building model inputs...', flush=True)
-    x, z, schema = model_inputs(fit, valid, args.include_promo, not args.no_history, args.model)
+    x, z, schema = model_inputs(fit, valid, args.include_promo, not args.no_history, args.model, args.drop_features)
     model, best = fit_model(x, fit.returned, z, valid.returned, schema, args, args.output_dir, args.iterations)
     pred = model.predict_proba(z)[:, 1]
     metrics = evaluation(valid, pred, fit)
@@ -207,12 +240,19 @@ def main():
             fit = fit.loc[fit['_order_time'] >= origin - pd.DateOffset(months=args.train_months)].copy()
         final_dir = args.output_dir / 'final'
         final_dir.mkdir()
-        x, z, schema = model_inputs(fit, test, args.include_promo, not args.no_history, args.model)
+        x, z, schema = model_inputs(fit, test, args.include_promo, not args.no_history, args.model, args.drop_features)
         model, _ = fit_model(x, fit.returned, None, None, schema, args, final_dir, best)
         pred = model.predict_proba(z)[:, 1]
         sample = pd.read_parquet(args.prepared_dir / 'sample_submission.parquet')
         write_submission(sample, test.order_line_id, pred, args.output_dir / 'submission.csv')
         pd.DataFrame({'order_line_id': test.order_line_id, 'prediction': pred}).to_parquet(args.output_dir / 'test_predictions.parquet', index=False)
+        from .prepare import sha256
+        (args.output_dir / 'submission_manifest.json').write_text(json.dumps({
+            'submission_sha256': sha256(args.output_dir / 'submission.csv'),
+            'test_prediction_sha256': sha256(args.output_dir / 'test_predictions.parquet'),
+            'rows': len(test), 'config': config, 'best_iterations': best,
+            'validation_auc': metrics['auc'],
+        }, indent=2))
         (final_dir / 'refit.json').write_text(json.dumps({'rows': len(fit), 'iterations': best, 'test_rows': len(test)}, indent=2))
     (args.output_dir / 'COMPLETE.json').write_text(json.dumps({'elapsed_seconds': time.monotonic() - started, 'finalized': args.finalize}))
     print(f'Run complete: {args.output_dir}', flush=True)
