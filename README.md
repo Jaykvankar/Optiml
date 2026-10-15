@@ -42,6 +42,11 @@ For the two portable GPU candidate notebooks, install:
 .\.venv\Scripts\python.exe -m pip install -r requirements-gpu.txt
 ```
 
+For the new teammate-oriented two-view model, see
+[`TEAMMATE_GPU_PIPELINE.md`](TEAMMATE_GPU_PIPELINE.md). It trains a line model
+and an independent target-free order-context model and is conservative enough
+to start on an RTX 3050.
+
 Place the seven competition CSVs in a local `data/` folder:
 `train.csv`, `test.csv`, `customers.csv`, `products.csv`, `stores.csv`,
 `calendar.csv`, and `sample_submission.csv`. These files are intentionally excluded
