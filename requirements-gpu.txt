@@ -1,0 +1,4 @@
+-r requirements.txt
+catboost>=1.2,<2
+xgboost>=2.0,<4
+torch>=2.2,<3

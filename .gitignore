@@ -20,3 +20,7 @@ analysis/
 submissions/
 .env
 kaggle.json
+/tools/*
+!/tools/
+!/tools/check_sota_environment.py
+/.freebuff
